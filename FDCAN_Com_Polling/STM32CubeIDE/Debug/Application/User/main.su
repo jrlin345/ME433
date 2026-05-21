@@ -1,0 +1,7 @@
+C:/Users/Joshua/Downloads/ME433/FDCAN_Com_Polling/Src/main.c:79:5:main	40	static
+C:/Users/Joshua/Downloads/ME433/FDCAN_Com_Polling/Src/main.c:235:6:SystemClock_Config	64	static
+C:/Users/Joshua/Downloads/ME433/FDCAN_Com_Polling/Src/main.c:274:13:MX_FDCAN1_Init	8	static
+C:/Users/Joshua/Downloads/ME433/FDCAN_Com_Polling/Src/main.c:317:13:MX_GPIO_Init	16	static
+C:/Users/Joshua/Downloads/ME433/FDCAN_Com_Polling/Src/main.c:336:6:BSP_PB_Callback	16	static
+C:/Users/Joshua/Downloads/ME433/FDCAN_Com_Polling/Src/main.c:362:17:BufferCmp8b	24	static
+C:/Users/Joshua/Downloads/ME433/FDCAN_Com_Polling/Src/main.c:382:6:Error_Handler	8	static
