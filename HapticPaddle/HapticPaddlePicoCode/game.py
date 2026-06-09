@@ -1,229 +1,269 @@
+"""
+Haptic Paddle Wall Game
+Reads position and desired_force from Pico over serial.
+Serial format: "pos, desired_force\n"  e.g. "142, 87.3"
+
+Usage:
+    pip install pygame pyserial
+    python haptic_game.py --port COM3        (Windows)
+    python haptic_game.py --port /dev/ttyACM0  (Linux/Mac)
+"""
+
 import pygame
 import serial
-import serial.tools.list_ports
+import threading
+import argparse
 import sys
 import math
-import random
+import time
 
-# ── Serial config ─────────────────────────────────────────────────────────────
-BAUD_RATE     = 115200
-THROTTLE_DEG  = 345   # degrees above which car accelerates
+# ── Config ───────────────────────────────────────────────────────────────────
+WIDTH, HEIGHT = 900, 600
+FPS = 60
 
-# ── Display config ────────────────────────────────────────────────────────────
-W, H          = 900, 500
-FPS           = 60
+WALL_START_POS = 130   # matches your Pico code
+POS_MIN = 0
+POS_MAX = 149
 
-# ── Physics ───────────────────────────────────────────────────────────────────
-MAX_SPEED     = 8.0
-ACCEL         = 0.18
-DECEL         = 0.12
-CAR_Y         = H // 2 + 60
+# ── Colours ──────────────────────────────────────────────────────────────────
+BG          = (10,  12,  20)
+TRACK_BG    = (25,  28,  45)
+TRACK_EDGE  = (50,  55,  90)
+FREE_COL    = (60, 180, 120)
+WALL_COL    = (220, 70,  50)
+PADDLE_COL  = (255, 220,  60)
+FORCE_COL   = (100, 160, 255)
+TEXT_COL    = (200, 210, 230)
+DIM_COL     = (80,  90, 110)
+GLOW_COL    = (255, 200,  40)
 
-# ── Colors ────────────────────────────────────────────────────────────────────
-SKY_TOP       = (15,  20,  40)
-SKY_BOT       = (30,  50,  90)
-ROAD_DARK     = (30,  30,  35)
-ROAD_LINE     = (240, 220, 60)
-GRASS_TOP     = (40,  90,  40)
-GRASS_BOT     = (20,  60,  20)
-CAR_BODY      = (220, 50,  50)
-CAR_ROOF      = (180, 30,  30)
-CAR_WINDOW    = (160, 210, 240)
-WHEEL_COL     = (25,  25,  25)
-HUD_BG        = (0,   0,   0,  160)
-WHITE         = (255, 255, 255)
-YELLOW        = (240, 220, 60)
-RED           = (220, 60,  60)
-GREEN         = (60,  200, 80)
+# ── Shared state (updated by serial thread) ───────────────────────────────────
+state = {
+    "pos":           0,
+    "desired_force": 0.0,
+    "connected":     False,
+    "error":         "",
+}
+state_lock = threading.Lock()
 
-# ─────────────────────────────────────────────────────────────────────────────
-def find_pico_port():
-    ports = serial.tools.list_ports.comports()
-    for p in ports:
-        if any(k in p.description.lower() for k in ["pico", "usb serial", "uart", "cdc"]):
-            return p.device
-    # fallback: first available
-    return ports[0].device if ports else None
 
-# ─────────────────────────────────────────────────────────────────────────────
-def draw_background(surf, scroll):
-    # Sky gradient
-    for y in range(CAR_Y - 120):
-        t = y / (CAR_Y - 120)
-        r = int(SKY_TOP[0] + t * (SKY_BOT[0] - SKY_TOP[0]))
-        g = int(SKY_TOP[1] + t * (SKY_BOT[1] - SKY_TOP[1]))
-        b = int(SKY_TOP[2] + t * (SKY_BOT[2] - SKY_TOP[2]))
-        pygame.draw.line(surf, (r, g, b), (0, y), (W, y))
+def serial_reader(port, baud=115200):
+    """Background thread: parse 'pos, desired_force\\n' lines from Pico."""
+    try:
+        ser = serial.Serial(port, baud, timeout=1)
+        with state_lock:
+            state["connected"] = True
+        while True:
+            line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) >= 2:
+                try:
+                    pos = int(parts[0].strip())
+                    force = float(parts[1].strip())
+                    with state_lock:
+                        state["pos"] = max(POS_MIN, min(POS_MAX, pos))
+                        state["desired_force"] = force
+                except ValueError:
+                    pass
+    except serial.SerialException as e:
+        with state_lock:
+            state["error"] = str(e)
 
-    horizon_y = CAR_Y - 120
 
-    # Grass
-    for y in range(horizon_y, H):
-        t = (y - horizon_y) / (H - horizon_y)
-        r = int(GRASS_TOP[0] + t * (GRASS_BOT[0] - GRASS_TOP[0]))
-        g = int(GRASS_TOP[1] + t * (GRASS_BOT[1] - GRASS_TOP[1]))
-        b = int(GRASS_TOP[2] + t * (GRASS_BOT[2] - GRASS_TOP[2]))
-        pygame.draw.line(surf, (r, g, b), (0, y), (W, y))
+def lerp(a, b, t):
+    return a + (b - a) * t
 
-    # Road
-    road_top_w = 200
-    road_bot_w = W
-    road_top_y = horizon_y
-    road_bot_y = H
 
-    road_pts = [
-        (W//2 - road_top_w//2, road_top_y),
-        (W//2 + road_top_w//2, road_top_y),
-        (W,                    road_bot_y),
-        (0,                    road_bot_y),
-    ]
-    pygame.draw.polygon(surf, ROAD_DARK, road_pts)
+def draw_rounded_rect(surf, color, rect, radius):
+    pygame.draw.rect(surf, color, rect, border_radius=radius)
 
-    # Dashed centre line (perspective scroll)
-    num_dashes = 8
-    for i in range(num_dashes):
-        t0 = (i     / num_dashes + scroll * 0.003) % 1.0
-        t1 = ((i + 0.5) / num_dashes + scroll * 0.003) % 1.0
-        for ta, tb in [(t0, min(t0 + 0.04, 1.0))]:
-            ya = int(road_top_y + ta * (road_bot_y - road_top_y))
-            yb = int(road_top_y + tb * (road_bot_y - road_top_y))
-            wa = int(road_top_w//2 * (1 - ta) * 0.05)
-            xa = W // 2
-            pygame.draw.line(surf, ROAD_LINE, (xa, ya), (xa, yb), max(1, int(4 * ta)))
 
-# ─────────────────────────────────────────────────────────────────────────────
-def draw_car(surf, x, y, speed):
-    # Wheel spin angle based on speed
-    wheel_r = 14
+def pos_to_x(pos, track_x, track_w):
+    """Map 0-149 position to pixel x on the track."""
+    return track_x + int((pos / POS_MAX) * track_w)
 
-    # Body
-    body_rect = pygame.Rect(x - 55, y - 22, 110, 40)
-    pygame.draw.rect(surf, CAR_BODY, body_rect, border_radius=8)
 
-    # Roof
-    roof_pts = [(x - 30, y - 22), (x + 30, y - 22),
-                (x + 22, y - 42), (x - 22, y - 42)]
-    pygame.draw.polygon(surf, CAR_ROOF, roof_pts)
-
-    # Window
-    win_pts = [(x - 22, y - 24), (x + 22, y - 24),
-               (x + 16, y - 40), (x - 16, y - 40)]
-    pygame.draw.polygon(surf, CAR_WINDOW, win_pts)
-
-    # Wheels
-    for wx, wy in [(x - 35, y + 16), (x + 35, y + 16)]:
-        pygame.draw.circle(surf, WHEEL_COL, (wx, wy), wheel_r)
-        pygame.draw.circle(surf, (80, 80, 80), (wx, wy), wheel_r - 4)
-        # Spoke
-        angle = (pygame.time.get_ticks() * 0.01 * speed) % (2 * math.pi)
-        for spoke in range(4):
-            a = angle + spoke * math.pi / 2
-            sx = wx + int(math.cos(a) * (wheel_r - 5))
-            sy = wy + int(math.sin(a) * (wheel_r - 5))
-            pygame.draw.line(surf, (60, 60, 60), (wx, wy), (sx, sy), 2)
-
-    # Headlights
-    pygame.draw.circle(surf, (255, 255, 180), (x + 52, y - 5), 5)
-    pygame.draw.circle(surf, (255, 255, 180), (x - 52, y - 5), 5)
-
-# ─────────────────────────────────────────────────────────────────────────────
-def draw_hud(surf, pos, force, speed, throttle, font, small_font):
-    # HUD panel
-    hud = pygame.Surface((260, 110), pygame.SRCALPHA)
-    hud.fill((0, 0, 0, 150))
-    surf.blit(hud, (10, 10))
-
-    # Speedometer bar
-    spd_pct = speed / MAX_SPEED
-    pygame.draw.rect(surf, (50, 50, 50), (20, 20, 180, 14), border_radius=7)
-    bar_col  = GREEN if spd_pct < 0.6 else YELLOW if spd_pct < 0.85 else RED
-    pygame.draw.rect(surf, bar_col, (20, 20, int(180 * spd_pct), 14), border_radius=7)
-    surf.blit(small_font.render(f"SPD  {speed:.1f}", True, WHITE), (210, 18))
-
-    # Paddle position
-    surf.blit(small_font.render(f"POS  {pos}°", True, WHITE), (20, 44))
-    surf.blit(small_font.render(f"FORCE {force}", True, WHITE), (20, 64))
-
-    # Throttle indicator
-    throttle_txt = "THROTTLE" if throttle else "COAST"
-    col = GREEN if throttle else RED
-    surf.blit(small_font.render(throttle_txt, True, col), (20, 90))
-
-# ─────────────────────────────────────────────────────────────────────────────
 def main():
-    # ── Find and open serial port ─────────────────────────────────────────────
-    port = find_pico_port()
-    if port is None:
-        print("No serial port found. Running in demo mode (random data).")
-        ser = None
-    else:
-        try:
-            ser = serial.Serial(port, BAUD_RATE, timeout=0)
-            print(f"Connected to {port}")
-        except Exception as e:
-            print(f"Could not open {port}: {e}. Running in demo mode.")
-            ser = None
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", default="COM4", help="Serial port (e.g. COM3 or /dev/ttyACM0)")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--demo", action="store_true", help="Run without hardware (simulated paddle)")
+    args = parser.parse_args()
+
+    if not args.demo and args.port is None:
+        args.port = "COM4"
 
     pygame.init()
-    screen = pygame.display.set_mode((W, H))
-    pygame.display.set_caption("Haptic Paddle Car")
-    clock  = pygame.time.Clock()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Haptic Paddle — Wall Demo")
+    clock = pygame.time.Clock()
 
-    font       = pygame.font.SysFont("monospace", 28, bold=True)
-    small_font = pygame.font.SysFont("monospace", 16)
+    font_large  = pygame.font.SysFont("Consolas", 42, bold=True)
+    font_medium = pygame.font.SysFont("Consolas", 22)
+    font_small  = pygame.font.SysFont("Consolas", 16)
 
-    # State
-    pos      = 0
-    force    = 0
-    speed    = 0.0
-    scroll   = 0.0
-    buf      = ""
+    if not args.demo:
+        t = threading.Thread(target=serial_reader, args=(args.port, args.baud), daemon=True)
+        t.start()
 
-    while True:
+    # demo sine wave
+    demo_t = 0.0
+
+    # smoothed values for rendering
+    smooth_pos   = 0.0
+    smooth_force = 0.0
+
+    # force bar history for sparkline
+    force_history = [0.0] * 120
+
+    running = True
+    while running:
+        dt = clock.tick(FPS) / 1000.0
+
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
+                running = False
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                pygame.quit(); sys.exit()
+                running = False
 
-        # ── Read serial ───────────────────────────────────────────────────────
-        if ser:
-            try:
-                buf += ser.read(ser.in_waiting or 1).decode("utf-8", errors="ignore")
-                while "\n" in buf:
-                    line, buf = buf.split("\n", 1)
-                    parts = line.strip().split(",")
-                    if len(parts) == 2:
-                        pos   = int(parts[0].strip())
-                        force = int(parts[1].strip())
-            except Exception:
-                pass
+        # ── Get state ────────────────────────────────────────────────────────
+        if args.demo:
+            demo_t += dt
+            # oscillate between 100 and 149 to show wall effect
+            raw_pos = int(120 + 29 * abs(math.sin(demo_t * 0.4)))
+            raw_force = max(0.0, (raw_pos - WALL_START_POS) / 19.0 * 150.0) if raw_pos > WALL_START_POS else 0.0
+            cur_pos, cur_force = raw_pos, raw_force
+            connected = True
+            err = ""
         else:
-            # Demo mode: simulate paddle
-            t   = pygame.time.get_ticks() / 1000
-            pos = int(180 + 100 * math.sin(t * 0.5))
+            with state_lock:
+                cur_pos   = state["pos"]
+                cur_force = state["desired_force"]
+                connected = state["connected"]
+                err       = state["error"]
 
-        # ── Physics ───────────────────────────────────────────────────────────
-        throttle = pos >= THROTTLE_DEG
-        if throttle:
-            speed = min(speed + ACCEL, MAX_SPEED)
+        smooth_pos   = lerp(smooth_pos,   float(cur_pos),   0.25)
+        smooth_force = lerp(smooth_force, cur_force,         0.2)
+        force_history.append(smooth_force)
+        force_history.pop(0)
+
+        in_wall = cur_pos > WALL_START_POS
+
+        # ── Draw ─────────────────────────────────────────────────────────────
+        screen.fill(BG)
+
+        # title
+        title = font_large.render("HAPTIC WALL", True, TEXT_COL)
+        screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 28))
+
+        # ── Track ────────────────────────────────────────────────────────────
+        TRACK_Y  = 200
+        TRACK_H  = 60
+        TRACK_X  = 80
+        TRACK_W  = WIDTH - 160
+
+        # background
+        draw_rounded_rect(screen, TRACK_BG, (TRACK_X, TRACK_Y, TRACK_W, TRACK_H), 12)
+
+        # free zone
+        free_w = int((WALL_START_POS / POS_MAX) * TRACK_W)
+        draw_rounded_rect(screen, (30, 70, 50), (TRACK_X, TRACK_Y, free_w, TRACK_H), 12)
+
+        # wall zone — intensity based on penetration
+        wall_x    = TRACK_X + free_w
+        wall_w    = TRACK_W - free_w
+        penetration = max(0.0, (cur_pos - WALL_START_POS) / (POS_MAX - WALL_START_POS))
+        wall_alpha_col = (
+            int(lerp(60, 220, penetration)),
+            int(lerp(30, 70,  penetration)),
+            int(lerp(30, 50,  penetration)),
+        )
+        draw_rounded_rect(screen, wall_alpha_col, (wall_x, TRACK_Y, wall_w, TRACK_H), 12)
+
+        # wall start marker
+        wall_marker_x = pos_to_x(WALL_START_POS, TRACK_X, TRACK_W)
+        pygame.draw.line(screen, WALL_COL, (wall_marker_x, TRACK_Y - 10), (wall_marker_x, TRACK_Y + TRACK_H + 10), 2)
+        wlabel = font_small.render("WALL", True, WALL_COL)
+        screen.blit(wlabel, (wall_marker_x - wlabel.get_width() // 2, TRACK_Y - 28))
+
+        # track border
+        pygame.draw.rect(screen, TRACK_EDGE, (TRACK_X, TRACK_Y, TRACK_W, TRACK_H), 2, border_radius=12)
+
+        # ── Paddle ───────────────────────────────────────────────────────────
+        paddle_x = pos_to_x(smooth_pos, TRACK_X, TRACK_W)
+        paddle_col = WALL_COL if in_wall else PADDLE_COL
+
+        # glow
+        if in_wall:
+            glow_r = int(lerp(20, 55, penetration))
+            glow_surf = pygame.Surface((glow_r * 2, glow_r * 2), pygame.SRCALPHA)
+            pygame.draw.circle(glow_surf, (*WALL_COL, 60), (glow_r, glow_r), glow_r)
+            screen.blit(glow_surf, (paddle_x - glow_r, TRACK_Y + TRACK_H // 2 - glow_r))
+
+        pygame.draw.circle(screen, paddle_col, (paddle_x, TRACK_Y + TRACK_H // 2), 22)
+        pygame.draw.circle(screen, BG,         (paddle_x, TRACK_Y + TRACK_H // 2), 10)
+
+        # position label under paddle
+        pos_label = font_small.render(f"{cur_pos}", True, paddle_col)
+        screen.blit(pos_label, (paddle_x - pos_label.get_width() // 2, TRACK_Y + TRACK_H + 14))
+
+        # ── Force bar ────────────────────────────────────────────────────────
+        BAR_X, BAR_Y, BAR_W, BAR_H = 80, 320, TRACK_W, 28
+        max_display_force = 160.0
+
+        draw_rounded_rect(screen, TRACK_BG, (BAR_X, BAR_Y, BAR_W, BAR_H), 6)
+        fill_w = int(min(1.0, smooth_force / max_display_force) * BAR_W)
+        if fill_w > 0:
+            draw_rounded_rect(screen, FORCE_COL, (BAR_X, BAR_Y, fill_w, BAR_H), 6)
+        pygame.draw.rect(screen, TRACK_EDGE, (BAR_X, BAR_Y, BAR_W, BAR_H), 2, border_radius=6)
+
+        bar_label = font_small.render("DESIRED FORCE", True, DIM_COL)
+        screen.blit(bar_label, (BAR_X, BAR_Y - 20))
+        bar_val = font_small.render(f"{smooth_force:.1f}", True, FORCE_COL)
+        screen.blit(bar_val, (BAR_X + BAR_W + 10, BAR_Y + 6))
+
+        # ── Sparkline ────────────────────────────────────────────────────────
+        SPARK_X, SPARK_Y, SPARK_W, SPARK_H = 80, 390, TRACK_W, 80
+        draw_rounded_rect(screen, TRACK_BG, (SPARK_X, SPARK_Y, SPARK_W, SPARK_H), 8)
+        if len(force_history) > 1:
+            pts = []
+            for i, fv in enumerate(force_history):
+                x = SPARK_X + int(i / len(force_history) * SPARK_W)
+                y = SPARK_Y + SPARK_H - int(min(1.0, fv / max_display_force) * SPARK_H)
+                pts.append((x, y))
+            pygame.draw.lines(screen, FORCE_COL, False, pts, 2)
+        pygame.draw.rect(screen, TRACK_EDGE, (SPARK_X, SPARK_Y, SPARK_W, SPARK_H), 1, border_radius=8)
+        slabel = font_small.render("FORCE HISTORY", True, DIM_COL)
+        screen.blit(slabel, (SPARK_X, SPARK_Y - 20))
+
+        # ── Status panel ─────────────────────────────────────────────────────
+        status_y = 500
+        if not args.demo:
+            if err:
+                s = font_medium.render(f"⚠ Serial error: {err}", True, WALL_COL)
+            elif not connected:
+                s = font_medium.render("Connecting to Pico...", True, DIM_COL)
+            else:
+                s = font_medium.render(f"● {args.port}  {args.baud} baud", True, FREE_COL)
+            screen.blit(s, (WIDTH // 2 - s.get_width() // 2, status_y))
         else:
-            speed = max(speed - DECEL, 0.0)
+            s = font_medium.render("DEMO MODE — no hardware", True, DIM_COL)
+            screen.blit(s, (WIDTH // 2 - s.get_width() // 2, status_y))
 
-        scroll += speed
+        # wall hit flash
+        if in_wall:
+            label = font_medium.render("▐ WALL CONTACT ▌", True, WALL_COL)
+            screen.blit(label, (WIDTH // 2 - label.get_width() // 2, 150))
 
-        # ── Draw ──────────────────────────────────────────────────────────────
-        draw_background(screen, scroll)
-        draw_car(screen, W // 2, CAR_Y, speed)
-        draw_hud(screen, pos, force, speed, throttle, font, small_font)
-
-        # Demo mode label
-        if not ser:
-            lbl = small_font.render("DEMO MODE — no serial", True, YELLOW)
-            screen.blit(lbl, (W - lbl.get_width() - 10, 10))
+        hint = font_small.render("ESC to quit", True, DIM_COL)
+        screen.blit(hint, (WIDTH - hint.get_width() - 20, HEIGHT - 28))
 
         pygame.display.flip()
-        clock.tick(FPS)
+
+    pygame.quit()
+
 
 if __name__ == "__main__":
     main()

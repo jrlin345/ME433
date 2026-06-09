@@ -29,13 +29,11 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define TX_ID          (0x111)   /* TX CAN message identifier    */
-#define RX_ID          (0x111)   /* RX CAN message identifier    */
+#define RX_ID          (0x150)   /* RX CAN message identifier    */
 
 /* INA219 I2C address.
    The INA219 default 7-bit address is 0x40.
@@ -74,7 +72,6 @@
 // Flip desired current every 100 samples.
 // 100 samples at 1 kHz = 100 ms.
 
-#define DESIRED_CURRENT_RAW 150
 // Desired current in raw INA219 units.
 // 150 raw is about 50 mA because raw / 3 ≈ mA.
 // Start low for safety.
@@ -116,7 +113,7 @@ uint8_t rxData[16U];
 static const uint8_t txData[] = {0x10, 0x32, 0x54, 0x76, 0x98, 0x00, 0x11, 0x22,
                                  0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00
                                 };
-
+volatile int DESIRED_CURRENT_RAW =150;
 volatile uint8_t state = 0;
 // state = 0 means do nothing
 // state = 1 means the user pressed 'a', so the interrupt should read ADC/current once
@@ -433,10 +430,10 @@ int main(void)
 
   /* STM32C0xx HAL library initialization:
        - Configure the Flash prefetch
-       - Systick timer is configured by default as source of time base, but user 
-         can eventually implement his proper time base source (a general purpose 
-         timer for example or other time source), keeping in mind that Time base 
-         duration should be kept 1ms since PPP_TIMEOUT_VALUEs are defined and 
+       - Systick timer is configured by default as source of time base, but user
+         can eventually implement his proper time base source (a general purpose
+         timer for example or other time source), keeping in mind that Time base
+         duration should be kept 1ms since PPP_TIMEOUT_VALUEs are defined and
          handled in milliseconds basis.
        - Low Level Initialization
      */
@@ -474,18 +471,16 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   /* Configure reception filter to Rx FIFO 0 */
-  FDCAN_FilterTypeDef        sFilterConfig;
-  sFilterConfig.IdType       = FDCAN_STANDARD_ID;
-  sFilterConfig.FilterIndex  = 0U;
-  sFilterConfig.FilterType   = FDCAN_FILTER_MASK;
+  FDCAN_FilterTypeDef sFilterConfig;
+  sFilterConfig.IdType = FDCAN_STANDARD_ID;
+  sFilterConfig.FilterIndex = 0U;
+  sFilterConfig.FilterType = FDCAN_FILTER_MASK;
   sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
-  sFilterConfig.FilterID1    = TX_ID;
-  sFilterConfig.FilterID2    = 0x7FF;
-  if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
-  {
-    Error_Handler();
+  sFilterConfig.FilterID1 = RX_ID;
+  sFilterConfig.FilterID2 = 0x7FF; // exact match mask
+  if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK) {
+  Error_Handler();
   }
-
   /**
     *  Configure global filter:
     *    - Filter all remote frames with STD and EXT ID
@@ -499,31 +494,14 @@ int main(void)
   }
 
   /* Prepare Tx message Header */
-  txHeader.Identifier          = TX_ID;
-  txHeader.IdType              = FDCAN_STANDARD_ID;
-  txHeader.TxFrameType         = FDCAN_DATA_FRAME;
-  txHeader.DataLength          = FDCAN_DLC_BYTES_16;
-  txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
-  txHeader.BitRateSwitch       = FDCAN_BRS_ON;
-  txHeader.FDFormat            = FDCAN_FD_CAN;
-  txHeader.TxEventFifoControl  = FDCAN_NO_TX_EVENTS;
-  txHeader.MessageMarker       = 0U;
+
 
   /**
     * Configure and enable Tx Delay Compensation, required for BRS mode.
     * TdcOffset default recommended value: DataTimeSeg1 * DataPrescaler
     * TdcFilter default recommended value: 0
     */
-  if (HAL_FDCAN_ConfigTxDelayCompensation(&hfdcan1,
-                                          (hfdcan1.Init.DataPrescaler * hfdcan1.Init.DataTimeSeg1), 0U) != HAL_OK)
-  {
-    Error_Handler();
-  }
 
-  if (HAL_FDCAN_EnableTxDelayCompensation(&hfdcan1) != HAL_OK)
-  {
-    Error_Handler();
-  }
 
   /* Start FDCAN controller */
   if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
@@ -562,6 +540,7 @@ int main(void)
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);
 
   /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
+  COM_InitTypeDef BspCOMInit;
   BspCOMInit.BaudRate   = 115200;
   BspCOMInit.WordLength = COM_WORDLENGTH_8B;
   BspCOMInit.StopBits   = COM_STOPBITS_1;
@@ -571,70 +550,31 @@ int main(void)
   {
     Error_Handler();
   }
+  printf("CAN RX ready, waiting for ID 0x%03X...\r\n", RX_ID);
 
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
+
+
   while (1)
   {
-      uint8_t received_char;
-
-      HAL_UART_Receive(&hcom_uart[COM1], &received_char, 1, HAL_MAX_DELAY);
-
-      if (received_char == '\n' || received_char == '\r')
+      if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) >= 1U)
       {
-          continue;
+          if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK)
+          {
+              if (rxHeader.DataLength == FDCAN_DLC_BYTES_4)
+              {
+                  float value;
+                  memcpy(&value, rxData, 4);
+                  DESIRED_CURRENT_RAW = (int)value;
+
+                  char msg[64];
+                  snprintf(msg, sizeof(msg), "CAN RX: desired_current = %d\r\n", DESIRED_CURRENT_RAW);
+                  send_string(msg);
+
+                  state = 1;  // start the motor controller
+              }
+          }
       }
-
-      if (received_char == 'a')
-      {
-          send_string("Starting current control test\r\n");
-
-          motor_killed = 0;
-          samples_collected = 0;
-
-          state = 1;
-
-          while (state == 1)
-          {
-              // Wait until interrupt finishes the 400-sample test
-          }
-
-          if (motor_killed == 1)
-          {
-              send_string("SAFETY STOP: ADC outside safe range\r\n");
-          }
-
-          send_string("index,desired,current,position\r\n");
-
-          for (int i = 0; i < samples_collected; i++)
-          {
-              char msg[80];
-
-              snprintf(msg, sizeof(msg), "%d,%d,%d,%lu\r\n",
-                       i,
-                       desired_current_array[i],
-                       measured_current_array[i],
-					   position_array[i]);
-
-              HAL_UART_Transmit(&hcom_uart[COM1], (uint8_t *)msg, strlen(msg), HAL_MAX_DELAY);
-          }
-
-          send_string("Done\r\n");
-      }
-
-      if (received_char == 'p'){
-
-		  test_motor_pwm();
-
-		  if (motor_killed == 1)
-		  {
-			  send_string("SAFETY STOP: ADC outside safe range\r\n");
-		  }
-
-	}
-
   }
-  /* USER CODE END 3 */
 }
 
 /**
@@ -737,42 +677,37 @@ static void MX_ADC1_Init(void)
   * @param None
   * @retval None
   */
-static void MX_FDCAN1_Init(void)
-{
+static void MX_FDCAN1_Init(void) {
+hfdcan1.Instance = FDCAN1;
+hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
+hfdcan1.Init.FrameFormat = FDCAN_FRAME_CLASSIC; // classic CAN, not FD
+hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
+hfdcan1.Init.AutoRetransmission = ENABLE;
+hfdcan1.Init.TransmitPause = ENABLE;
+hfdcan1.Init.ProtocolException = DISABLE;
 
-  /* USER CODE BEGIN FDCAN1_Init 0 */
+// 500kbit/s with 48MHz HSI clock:
+// Tq = 1 / (48MHz / NominalPrescaler)
+// Bit time = (1 + NominalTimeSeg1 + NominalTimeSeg2) Tq
+// 48MHz / 6 = 8MHz -> 125ns per Tq
+// (1 + 11 + 4) * 125ns = 2000ns = 500kbit/s
+hfdcan1.Init.NominalPrescaler = 24;
+hfdcan1.Init.NominalSyncJumpWidth = 4;
+hfdcan1.Init.NominalTimeSeg1 = 11;
+hfdcan1.Init.NominalTimeSeg2 = 4;
 
-  /* USER CODE END FDCAN1_Init 0 */
+hfdcan1.Init.DataPrescaler = 24;
+hfdcan1.Init.DataSyncJumpWidth = 4;
+hfdcan1.Init.DataTimeSeg1 = 11;
+hfdcan1.Init.DataTimeSeg2 = 4;
 
-  /* USER CODE BEGIN FDCAN1_Init 1 */
+hfdcan1.Init.StdFiltersNbr = 1;
+hfdcan1.Init.ExtFiltersNbr = 0;
+hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
 
-  /* USER CODE END FDCAN1_Init 1 */
-  hfdcan1.Instance = FDCAN1;
-  hfdcan1.Init.ClockDivider = FDCAN_CLOCK_DIV1;
-  hfdcan1.Init.FrameFormat = FDCAN_FRAME_FD_BRS;
-  hfdcan1.Init.Mode = FDCAN_MODE_NORMAL;
-  hfdcan1.Init.AutoRetransmission = ENABLE;
-  hfdcan1.Init.TransmitPause = ENABLE;
-  hfdcan1.Init.ProtocolException = DISABLE;
-  hfdcan1.Init.NominalPrescaler = 1;
-  hfdcan1.Init.NominalSyncJumpWidth = 12;
-  hfdcan1.Init.NominalTimeSeg1 = 35;
-  hfdcan1.Init.NominalTimeSeg2 = 12;
-  hfdcan1.Init.DataPrescaler = 1;
-  hfdcan1.Init.DataSyncJumpWidth = 6;
-  hfdcan1.Init.DataTimeSeg1 = 17;
-  hfdcan1.Init.DataTimeSeg2 = 6;
-  hfdcan1.Init.StdFiltersNbr = 1;
-  hfdcan1.Init.ExtFiltersNbr = 0;
-  hfdcan1.Init.TxFifoQueueMode = FDCAN_TX_FIFO_OPERATION;
-  if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN FDCAN1_Init 2 */
-
-  /* USER CODE END FDCAN1_Init 2 */
-
+if (HAL_FDCAN_Init(&hfdcan1) != HAL_OK) {
+Error_Handler();
+}
 }
 
 /**
@@ -1046,14 +981,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             signed short desired_current;
 
             // Flip desired current every 100 samples
-            if ((counter / CURRENT_FLIP_TIME) % 2 == 0)
-            {
-                desired_current = DESIRED_CURRENT_RAW;
-            }
-            else
-            {
-                desired_current = -DESIRED_CURRENT_RAW;
-            }
+            desired_current = DESIRED_CURRENT_RAW;
 
             int error = desired_current - actual_current;
 
@@ -1074,12 +1002,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
             if (counter >= NSAMPLES)
             {
-                motor_off();
-
-                state = 0;
-
-                counter = 0;
-                eint = 0.0f;
+                counter = 0;  // just wrap, keep running
+                eint = 0.0f;  // reset integrator to prevent windup
             }
         }
     }

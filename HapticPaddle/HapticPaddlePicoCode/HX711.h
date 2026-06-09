@@ -9,5 +9,7 @@
 
 void init_HX711();
 int  read_HX711();
+void tare_HX711();
+float convert_raw_N(int raw);
 
 #endif

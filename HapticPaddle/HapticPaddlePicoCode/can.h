@@ -3,8 +3,8 @@
 
 #include "pico/stdlib.h"
 
-#define CAN_TX_PIN 10
-#define CAN_RX_PIN 11
+#define CAN_TX_PIN 12
+#define CAN_RX_PIN 13
 
 void can_init(void);
 bool can_send_float(uint32_t id, float value);
